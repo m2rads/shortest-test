@@ -2,7 +2,7 @@
 
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { Octokit } from "@octokit/rest";
-import { TestFile } from "../app/(dashboard)/dashboard/types";
+import { TestFile, PullRequest } from "../app/(dashboard)/dashboard/types";
 
 export async function getOctokit() {
   const { userId } = auth();
@@ -39,7 +39,7 @@ export async function getAssignedPullRequests() {
 
         const branchName = pullRequestData.head.ref;
 
-        const buildStatus = await fetchBuildStatus(
+        const buildStatus = await fetchBuildStatusForRef(
           octokit,
           owner,
           repo,
@@ -71,7 +71,41 @@ export async function getAssignedPullRequests() {
   }
 }
 
-async function fetchBuildStatus(
+export async function fetchBuildStatus(owner: string, repo: string, pullNumber: number): Promise<PullRequest> {
+  const octokit = await getOctokit();
+
+  try {
+    const { data: pr } = await octokit.pulls.get({
+      owner,
+      repo,
+      pull_number: pullNumber,
+    });
+
+    const buildStatus = await fetchBuildStatusForRef(octokit, owner, repo, pr.head.ref);
+
+    return {
+      id: pr.id,
+      title: pr.title,
+      number: pr.number,
+      buildStatus,
+      isDraft: pr.draft || false,
+      branchName: pr.head.ref,
+      repository: {
+        id: pr.base.repo.id,
+        name: pr.base.repo.name,
+        full_name: pr.base.repo.full_name,
+        owner: {
+          login: pr.base.repo.owner.login,
+        },
+      },
+    };
+  } catch (error) {
+    console.error("Error fetching build status:", error);
+    throw error;
+  }
+}
+
+async function fetchBuildStatusForRef(
   octokit: Octokit,
   owner: string,
   repo: string,
@@ -84,21 +118,26 @@ async function fetchBuildStatus(
       ref,
     });
 
-    if (data.check_runs.length === 0) {
+    if (data.total_count === 0) {
       return "pending";
     }
 
-    const statuses = data.check_runs.map((run) => run.conclusion);
-    if (statuses.every((status) => status === "success")) {
+    const statuses = data.check_runs.map((run) => run.status);
+    if (statuses.some((status) => status === "in_progress")) {
+      return "running";
+    }
+
+    const conclusions = data.check_runs.map((run) => run.conclusion);
+    if (conclusions.every((conclusion) => conclusion === "success")) {
       return "success";
-    } else if (statuses.some((status) => status === "failure")) {
+    } else if (conclusions.some((conclusion) => conclusion === "failure")) {
       return "failure";
     } else {
       return "pending";
     }
   } catch (error) {
     console.error("Error fetching build status:", error);
-    return "unknown";
+    return "pending";
   }
 }
 
@@ -106,7 +145,8 @@ export async function commitChangesToPullRequest(
   owner: string,
   repo: string,
   pullNumber: number,
-  filesToCommit: TestFile[]
+  filesToCommit: TestFile[],
+  commitMessage: string
 ): Promise<string> {
   const octokit = await getOctokit();
 
@@ -181,7 +221,7 @@ export async function commitChangesToPullRequest(
     const { data: newCommit } = await octokit.git.createCommit({
       owner,
       repo,
-      message: "Update test files",
+      message: commitMessage,
       tree: newTree.sha,
       parents: [commit.sha],
     });
@@ -268,5 +308,61 @@ export async function getPullRequestInfo(
   } catch (error) {
     console.error("Error fetching PR info:", error);
     throw new Error("Failed to fetch PR info");
+  }
+}
+
+export async function getFailingTests(
+  owner: string,
+  repo: string,
+  pullNumber: number
+): Promise<TestFile[]> {
+  const octokit = await getOctokit();
+
+  try {
+    const { data: checkRuns } = await octokit.checks.listForRef({
+      owner,
+      repo,
+      ref: `refs/pull/${pullNumber}/head`,
+      status: 'completed',
+      filter: 'latest',
+    });
+
+    const failedChecks = checkRuns.check_runs.filter(
+      (run) => run.conclusion === 'failure'
+    );
+
+    const failingTestFiles: TestFile[] = [];
+    for (const check of failedChecks) {
+      if (check.output.annotations_count > 0) {
+        const { data: annotations } = await octokit.checks.listAnnotations({
+          owner,
+          repo,
+          check_run_id: check.id,
+        });
+
+        for (const annotation of annotations) {
+          if (annotation.path.includes('test') || annotation.path.includes('spec')) {
+            const { data: fileContent } = await octokit.repos.getContent({
+              owner,
+              repo,
+              path: annotation.path,
+              ref: `refs/pull/${pullNumber}/head`,
+            });
+
+            if ('content' in fileContent) {
+              failingTestFiles.push({
+                name: annotation.path,
+                content: Buffer.from(fileContent.content, 'base64').toString('utf-8'),
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return failingTestFiles;
+  } catch (error) {
+    console.error('Error fetching failing tests:', error);
+    throw error;
   }
 }
