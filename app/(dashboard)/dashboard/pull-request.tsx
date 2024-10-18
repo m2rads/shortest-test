@@ -1,7 +1,12 @@
 "use client";
 
-import { useCallback, useState } from "react";
-import { Button } from "@/components/ui/button";
+import { useState, useCallback } from "react";
+import { experimental_useObject as useObject } from "ai/react";
+import Link from "next/link";
+import dynamic from "next/dynamic";
+import { cn } from "@/lib/utils";
+import useSWR from "swr";
+import { TestFileSchema } from "@/app/api/generate-tests/schema";
 import {
   GitPullRequestDraft,
   GitPullRequest,
@@ -14,24 +19,21 @@ import {
   ChevronDown,
   ChevronUp,
 } from "lucide-react";
-import Link from "next/link";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import dynamic from "next/dynamic";
-import { PullRequest, TestFile } from "./types";
+import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
 import {
   commitChangesToPullRequest,
   getPullRequestInfo,
   getFailingTests,
+  getLatestRunId,
+  fetchBuildStatus,
+  getWorkflowLogs
 } from "@/lib/github";
-import { Input } from "@/components/ui/input";
-import useSWR from "swr";
-import { fetchBuildStatus } from "@/lib/github";
-import { experimental_useObject as useObject } from "ai/react";
-import { TestFileSchema } from "@/app/api/generate-tests/schema";
 import { LogView } from "./log-view";
-import { getLatestRunId } from "@/lib/github";
-import { cn } from "@/lib/utils";
+import { PullRequest, TestFile, LogGroup } from "./types";
+import { useLogGroups } from "@/hooks/use-log-groups";
 
 const ReactDiffViewer = dynamic(() => import("react-diff-viewer"), {
   ssr: false,
@@ -83,6 +85,25 @@ export function PullRequestItem({
         pullRequest.branchName
       )
   );
+
+  const { data: logs, error: logsError } = useSWR(
+    latestRunId
+      ? ['workflowLogs', pullRequest.repository.owner.login, pullRequest.repository.name, latestRunId]
+      : null,
+    () => getWorkflowLogs(pullRequest.repository.owner.login, pullRequest.repository.name, latestRunId!),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+    }
+  );
+
+  const parsedLogs = useLogGroups(logs);
+
+  const filterTestLogs = useCallback((parsedLogs: LogGroup[]) => {
+    return parsedLogs.filter((group: LogGroup) => 
+      group.name.toLowerCase().includes('test')
+    );
+  }, []);
 
   const [testFiles, setTestFiles] = useState<TestFile[]>([]);
   const [oldTestFiles, setOldTestFiles] = useState<TestFile[]>([]);
@@ -143,6 +164,7 @@ export function PullRequestItem({
       );
 
       let testFilesToUpdate = oldTestFiles;
+      let relevantLogs: LogGroup[] = [];
 
       if (mode === "update") {
         const failingTests = await getFailingTests(
@@ -153,6 +175,9 @@ export function PullRequestItem({
         testFilesToUpdate = oldTestFiles.filter((file) =>
           failingTests.some((failingFile) => failingFile.name === file.name)
         );
+
+        // Filter and include relevant test logs
+        relevantLogs = filterTestLogs(parsedLogs);
       }
 
       setOldTestFiles(testFilesToUpdate);
@@ -161,10 +186,11 @@ export function PullRequestItem({
         pr_id: pr.id,
         pr_diff: diff,
         test_files: testFilesToUpdate,
+        test_logs: relevantLogs,
       });
     } catch (error) {
-      console.error("Error generating test files:", error);
-      setError("Failed to generate test files.");
+      console.error("Error handling tests:", error);
+      setError("Failed to handle tests.");
       setAnalyzing(false);
       setLoading(false);
     }
@@ -476,9 +502,9 @@ export function PullRequestItem({
       {showLogs && latestRunId && (
         <div className="mt-4">
           <LogView
-            owner={pullRequest.repository.owner.login}
-            repo={pullRequest.repository.name}
-            runId={latestRunId}
+            parsedLogs={parsedLogs}
+            error={logsError}
+            isLoading={!logs && !logsError}
           />
         </div>
       )}
