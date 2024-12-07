@@ -12,6 +12,10 @@ export class AIClient {
   private debugMode: boolean;
 
   constructor(config: AIConfig, debugMode: boolean = false) {
+    if (!config.apiKey) {
+      throw new Error('Anthropic API key is required. Set it in shortest.config.ts or ANTHROPIC_API_KEY env var');
+    }
+
     this.client = new Anthropic({
       apiKey: config.apiKey
     });
@@ -73,18 +77,19 @@ export class AIClient {
           betas: ["computer-use-2024-10-22"]
         });
 
-        // Log AI response
+        // Log AI response and tool usage
         if (this.debugMode) {
           response.content.forEach(block => {
             if (block.type === 'text') {
               console.log(pc.green('\n🤖 AI:'), pc.dim((block as any).text));
+            } else if (block.type === 'tool_use') {
+              const toolBlock = block as Anthropic.Beta.Messages.BetaToolUseBlock;
+              console.log(pc.yellow('\n🔧 Tool Request:'), {
+                tool: toolBlock.name,
+                input: toolBlock.input
+              });
             }
           });
-        }
-
-        // Log and callback for assistant's response
-        if (outputCallback) {
-          response.content.forEach(block => outputCallback(block as Anthropic.Beta.Messages.BetaContentBlockParam));
         }
 
         // Add assistant's response to history
@@ -99,7 +104,6 @@ export class AIClient {
             .filter(block => block.type === 'tool_use')
             .map(block => {
               const toolBlock = block as Anthropic.Beta.Messages.BetaToolUseBlock;
-              
               return {
                 toolBlock,
                 result: browserTool.execute(toolBlock.input as any)
@@ -107,6 +111,14 @@ export class AIClient {
             });
 
           const results = await Promise.all(toolResults.map(t => t.result));
+
+          // Log tool results
+          if (this.debugMode) {
+            results.forEach((result, i) => {
+              const { base64_image, ...logResult } = result;
+              console.log(pc.blue('\n🔧 Tool Result:'), logResult);
+            });
+          }
 
           // Add tool results to message history
           messages.push({
@@ -127,7 +139,7 @@ export class AIClient {
                   type: 'text' as const,
                   text: result.output || ''
                 }]
-            } as Anthropic.Beta.Messages.BetaToolResultBlockParam))
+            }))
           });
 
         } else {
